@@ -56,9 +56,7 @@ JS_SCRAPE_ACTION_ONLY = r"""
     const r = el.getBoundingClientRect(); return r.width > 120 && r.height > 120;
   }
   function hasAction(el){
-    // structural signals (prefer these in headless)
-    if (el.querySelector('button, [role="button"], [data-test*=\"add\"], [data-qa*=\"add\"]')) return true;
-    // text fallback
+    if (el.querySelector('button, [role="button"], [data-test*="add"], [data-qa*="add"]')) return true;
     const t = (el.innerText || el.textContent || '').toLowerCase();
     return /add\s*to\s*cart|shop\s*all\s*options|add\s*to\s*basket|add\s*to\s*trolley/.test(t);
   }
@@ -66,14 +64,12 @@ JS_SCRAPE_ACTION_ONLY = r"""
   for (const c of cards) {
     try {
       if (!bigEnough(c) || !hasAction(c)) continue;
-      // use closest "card" ancestor for stable geometry
-      const pdp = c.querySelector('a[href*=\"/p/\"]:not([href*=\"/brand/\"]):not([href*=\"/search\"])');
+      const pdp = c.querySelector('a[href*="/p/"]:not([href*="/brand/"]):not([href*="/search"])');
       if (!pdp) continue;
-      const card = pdp.closest('article,li,div[data-ref*=\"product\"],div[data-ref*=\"tile\"],div[class*=\"product\"],div[class*=\"card\"]') || c;
+      const card = pdp.closest('article,li,div[data-ref*="product"],div[data-ref*="tile"],div[class*="product"],div[class*="card"]') || c;
       const r = card.getBoundingClientRect();
       const x = Math.round(r.left + window.scrollX), y = Math.round(r.top + window.scrollY);
-      let title = pdp.getAttribute('title') || pdp.innerText || pdp.textContent || '';
-      title = title.trim();
+      let title = (pdp.getAttribute('title') || pdp.innerText || pdp.textContent || '').trim();
       if (!title) continue;
       out.push({ href: pdp.href, title, x, y, w: Math.round(r.width), h: Math.round(r.height) });
     } catch(e){}
@@ -88,66 +84,49 @@ JS_SCRAPE_RELAXED = r"""
 () => {
   const scope = document.querySelector('main') || document.body;
   if (!scope) return [];
-  const links = Array.from(scope.querySelectorAll('a[href*=\"/p/\"]:not([href*=\"/brand/\"]):not([href*=\"/search\"])'));
+  const links = Array.from(scope.querySelectorAll('a[href*="/p/"]:not([href*="/brand/"]):not([href*="/search"])'));
   const out = [];
   for (const pdp of links) {
     try {
-      const card = pdp.closest('article,li,div[data-ref*=\"product\"],div[data-ref*=\"tile\"],div[class*=\"product\"],div[class*=\"card\"]') || pdp;
+      const card = pdp.closest('article,li,div[data-ref*="product"],div[data-ref*="tile"],div[class*="product"],div[class*="card"]') || pdp;
       const r = card.getBoundingClientRect();
       if (r.width <= 120 || r.height <= 120) continue;
       const x = Math.round(r.left + window.scrollX), y = Math.round(r.top + window.scrollY);
-      let title = pdp.getAttribute('title') || pdp.innerText || pdp.textContent || '';
-      title = title.trim();
+      let title = (pdp.getAttribute('title') || pdp.innerText || pdp.textContent || '').trim();
       if (!title) continue;
       out.push({ href: pdp.href, title, x, y, w: Math.round(r.width), h: Math.round(r.height) });
     } catch(e){}
   }
-  out.sort((a,b)=> (a.y-b.y) || (a.x-b.x));
+  out.sort((a,b)=> (a.y-b.y) || (a.x-b-x));
   return out;
 }
 """
 
-async def force_products_tab(page):
-    for s in ["a:has-text('Products')", "button:has-text('Products')", "li:has-text('Products') a"]:
-        try:
-            el = page.locator(s).first
-            if await el.is_visible(timeout=1500):
-                await el.click()
-                return
-        except Exception:
-            pass
+async def wait_for_min_products(page, minimum=8, timeout_ms=25000):
+    elapsed = 0
+    while elapsed < timeout_ms:
+        count = await page.locator("a[href*='/p/']").count()
+        if count >= minimum: return True
+        await page.wait_for_timeout(500)
+        elapsed += 500
+    return False
 
-async def scroll_to_bottom(page, max_iters=60):
-    stable = 0
+async def scroll_to_bottom(page, max_iters=24):
     last = await page.evaluate("document.body.scrollHeight")
     for _ in range(max_iters):
         await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        await page.wait_for_timeout(1200)
+        await page.wait_for_timeout(800)
         cur = await page.evaluate("document.body.scrollHeight")
         if cur <= last:
-            stable += 1
-            if stable >= 2: break
-        else:
-            stable = 0
+            break
         last = cur
-    await page.wait_for_timeout(1200)
+    await page.wait_for_timeout(800)
 
 def assign_spots(items: List[Dict[str, Any]]) -> None:
     for i, it in enumerate(items, start=1):
         it["spot"] = i
 
-async def wait_for_min_products(page, minimum=8, timeout_ms=30000):
-    # Wait until at least `minimum` PDP links exist (headless-safe)
-    step = 0
-    elapsed = 0
-    while elapsed < timeout_ms:
-        count = await page.locator("a[href*='/p/']").count()
-        if count >= minimum: return
-        await page.wait_for_timeout(500)
-        elapsed += 500
-        step += 1
-
-async def find_spot(search_category: str, product_name: str) -> Tuple[Optional[int], list, bool, Optional[str]]:
+async def find_spot(search_category: str, product_name: str):
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True, args=["--no-sandbox"])
         context = await browser.new_context(
@@ -156,46 +135,53 @@ async def find_spot(search_category: str, product_name: str) -> Tuple[Optional[i
             locale="en-ZA",
             timezone_id="Africa/Johannesburg",
             extra_http_headers={"Accept-Language": ACCEPT_LANG},
-            geolocation={"latitude": -26.2041, "longitude": 28.0473},
-            permissions=["geolocation"],
         )
         page = await context.new_page()
 
-        # Direct search (headless-safe)
         q = quote_plus(search_category)
         url = f"https://www.takealot.com/all?_sb={q}"
         await page.goto(url, wait_until="domcontentloaded", timeout=60000)
 
-        await force_products_tab(page)
-        await wait_for_min_products(page, minimum=8, timeout_ms=30000)
-        await scroll_to_bottom(page, max_iters=60)
+        # ensure enough tiles exist
+        await wait_for_min_products(page, minimum=8, timeout_ms=25000)
+        await scroll_to_bottom(page)
 
-        # Try strict first
-        items = await page.evaluate(JS_SCRAPE_ACTION_ONLY)
-        items = dedupe_by_box(items)
-        items.sort(key=lambda x: (x["y"], x["x"]))
-        assign_spots(items)
-        used_fallback = False
+        # STRICT
+        strict = await page.evaluate(JS_SCRAPE_ACTION_ONLY)
+        strict = dedupe_by_box(strict)
+        strict.sort(key=lambda x: (x["y"], x["x"]))
+        assign_spots(strict)
 
-        # Fallback if nothing found
-        if len(items) == 0:
-            used_fallback = True
-            items = await page.evaluate(JS_SCRAPE_RELAXED)
-            items = dedupe_by_box(items)
-            items.sort(key=lambda x: (x["y"], x["x"]))
-            assign_spots(items)
+        # RELAXED
+        relaxed = await page.evaluate(JS_SCRAPE_RELAXED)
+        relaxed = dedupe_by_box(relaxed)
+        relaxed.sort(key=lambda x: (x["y"], x["x"]))
+        assign_spots(relaxed)
 
-        titles = [it["title"] for it in items]
-        spot, matched_title = smart_match(product_name, titles)
+        # Try match (first strict, then relaxed)
+        spot = None
+        matched_from = "strict"
+        titles_strict = [it["title"] for it in strict]
+        titles_relaxed = [it["title"] for it in relaxed]
+
+        if titles_strict:
+            spot_idx, matched_title = smart_match(product_name, titles_strict)
+            if spot_idx is not None:
+                spot = spot_idx
+            else:
+                matched_from = "relaxed"
+        if spot is None:
+            spot_idx, matched_title = smart_match(product_name, titles_relaxed)
+            if spot_idx is not None:
+                spot = spot_idx
 
         await context.close(); await browser.close()
-        return spot, items, used_fallback, matched_title
+        return spot, strict, relaxed
 
 # ============================== UI ==============================
 st.set_page_config(page_title="Takealot Spot Finder", page_icon="🔎", layout="centered")
 st.title("Takealot Spot Finder")
 
-# Prefill from URL params for Excel links
 params = st.query_params
 prefill_cat = params.get("cat", "")
 prefill_name = params.get("name", "")
@@ -209,24 +195,20 @@ if submitted:
     if not product_name.strip():
         st.error("Please enter the exact Product name.")
     else:
-        with st.spinner("Searching Takealot and locating the product..."):
-            spot, seen, used_fallback, matched_title = asyncio.run(find_spot(search_category.strip(), product_name.strip()))
+        with st.spinner("Searching..."):
+            spot, strict, relaxed = asyncio.run(find_spot(search_category.strip(), product_name.strip()))
 
         st.subheader("Result")
         if spot is not None:
-            if used_fallback:
-                st.info("Fallback used (no action buttons detected in headless).")
-            if matched_title and norm_title(matched_title) != norm_title(product_name):
-                st.success(f"Spot: {spot}  \nMatched: **{matched_title}**")
-            else:
-                st.success(f"Spot: {spot}")
-            st.caption("Spots are counted left→right in a 4-column grid (1–4, 5–8, 9–12, …).")
+            st.success(f"Spot: {spot}  (counted left→right, 4 per row)")
         else:
             st.warning("Product title not found among parsed tiles.")
-            if used_fallback:
-                st.caption("Note: Fallback mode used as no action buttons were detected in headless rendering.")
-            if seen:
-                st.write("First 12 parsed titles on the page:")
-                for it in seen[:12]:
-                    st.write(f"{it['spot']:>3}: {it['title']}")
+
+        # Always show what we saw (to debug headless rendering)
+        with st.expander(f"Strict (action buttons present) — {len(strict)} items"):
+            for it in strict[:30]:
+                st.write(f"{it['spot']:>3}: {it['title']}")
+        with st.expander(f"Relaxed (all product tiles) — {len(relaxed)} items"):
+            for it in relaxed[:30]:
+                st.write(f"{it['spot']:>3}: {it['title']}")
 
