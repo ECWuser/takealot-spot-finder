@@ -1,0 +1,9 @@
+# Ignore big/local stuff in Docker context
+.venv/
+.git/
+__pycache__/
+*.pyc
+.streamlit/
+debug_*.html
+debug_*.png
+*.log
