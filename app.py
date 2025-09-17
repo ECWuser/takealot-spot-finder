@@ -1,5 +1,6 @@
 import asyncio, json, re
 from typing import List, Dict, Any, Optional, Tuple
+from urllib.parse import quote_plus
 
 import streamlit as st
 from playwright.async_api import async_playwright
@@ -110,19 +111,6 @@ async def accept_cookies(page):
         except Exception:
             pass
 
-async def type_into_search(page, q: str):
-    for s in ["input[placeholder*='Search']", "input[type='search']", "form[role='search'] input", "#search"]:
-        try:
-            box = page.locator(s).first
-            await box.wait_for(state="visible", timeout=4000)
-            await box.click(); await box.fill("")
-            await box.type(q, delay=25)  # allow autosuggest
-            await box.press("Enter")
-            return
-        except Exception:
-            continue
-    raise RuntimeError("Search box not found")
-
 async def force_products_tab(page):
     for s in ["a:has-text('Products')", "button:has-text('Products')", "li:has-text('Products') a"]:
         try:
@@ -147,26 +135,21 @@ async def scroll_to_bottom(page, max_iters=50):
     await page.wait_for_timeout(1200)
 
 def assign_spots(items: List[Dict[str, Any]]) -> None:
-    # Items are already top->bottom, left->right. Spots are 1..n in that order.
     for i, it in enumerate(items, start=1):
         it["spot"] = i
 
 async def find_spot(search_category: str, product_name: str, save_debug=False) -> Tuple[Optional[int], list]:
     async with async_playwright() as pw:
-        # IMPORTANT for Render/Docker (no display server)
         browser = await pw.chromium.launch(headless=True, args=["--no-sandbox"])
         context = await browser.new_context(viewport=VIEWPORT, user_agent=USER_AGENT, locale="en-ZA")
         page = await context.new_page()
 
-        await page.goto("https://www.takealot.com/", wait_until="domcontentloaded", timeout=45000)
+        # Direct search URL avoids headless search box issues
+        q = quote_plus(search_category)
+        url = f"https://www.takealot.com/all?_sb={q}"
+        await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+
         await accept_cookies(page); await dismiss_popups(page)
-        await type_into_search(page, search_category)
-
-        try:
-            await page.wait_for_load_state("networkidle", timeout=30000)
-        except Exception:
-            pass
-
         await force_products_tab(page)
         await scroll_to_bottom(page, max_iters=60)
         await dismiss_popups(page)
@@ -205,7 +188,7 @@ prefill_cat = params.get("cat", "")
 prefill_name = params.get("name", "")
 
 with st.form("spot_form"):
-    search_category = st.text_input("Search category (typed into Takealot search):", value=(prefill_cat or "Blood pressure monitor"))
+    search_category = st.text_input("Search category:", value=(prefill_cat or "Blood pressure monitor"))
     product_name = st.text_input("Product name (exact title to locate):", value=(prefill_name or ""))
     save_debug = st.checkbox("Debug: save full-page screenshot + HTML", value=False)
     submitted = st.form_submit_button("Find spot")
