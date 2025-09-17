@@ -41,185 +41,78 @@ JS_SCRAPE_ACTION_ONLY = r"""
 
   function bigEnough(el){
     const r = el.getBoundingClientRect();
-    return r.width > 120 && r.height > 120;
+    return r.width > 100 && r.height > 100;
   }
 
-  for (const c of cards) {
-    try {
-      if (!bigEnough(c)) continue;
+  for (const el of cards) {
+    if (!bigEnough(el)) continue;
+    const text = el.innerText || "";
+    if (!ACTION_RX.test(text)) continue;
 
-      // Must contain bottom action text somewhere in the card
-      const visibleText = (c.innerText || c.textContent || "").trim();
-      if (!ACTION_RX.test(visibleText)) continue;
+    const r = el.getBoundingClientRect();
+    const titleEl = el.querySelector("a[href*='product']");
+    const title = titleEl ? titleEl.innerText.trim() : text.split("\n")[0].trim();
 
-      const r = c.getBoundingClientRect();
-      const x = Math.round(r.left + window.scrollX);
-      const y = Math.round(r.top  + window.scrollY);
-
-      // PDP link inside this card (ignore brand/search links)
-      const pdp = c.querySelector('a[href*="/p/"]:not([href*="/brand/"]):not([href*="/search"])');
-      const href = pdp ? pdp.href : "";
-
-      // Prefer heading-like title; fallback to link text
-      let title = "";
-      const h = c.querySelector('h1,h2,h3,h4,[data-ref*="title"], .title, [class*="title"]');
-      if (h) title = (h.innerText || h.textContent || "").trim();
-      if (!title && pdp) title = (pdp.getAttribute("title") || pdp.innerText || pdp.textContent || "").trim();
-
-      if (!title) continue;
-
-      out.push({ href, title, x, y, w: Math.round(r.width), h: Math.round(r.height) });
-    } catch(e){}
+    out.push({
+      x: r.left,
+      y: r.top,
+      title,
+    });
   }
-
-  // absolute page order: top->bottom, left->right
-  out.sort((a,b)=> (a.y-b.y) || (a.x-b.x));
   return out;
 }
 """
 
-async def dismiss_popups(page):
-    sels = [
-        "button:has-text('Accept')","button:has-text('Accept all')","button:has-text('Allow all')",
-        "button:has-text('Got it')","button:has-text('OK')","button:has-text('Close')",
-        "button[aria-label='Close']","button:has-text('No thanks')","button:has-text('Not now')",
-        "[data-test='close']","div[role='dialog'] button:has-text('×')",
-    ]
-    for s in sels:
-        try:
-            el = page.locator(s).first
-            if await el.is_visible(timeout=800): await el.click()
-        except Exception:
-            pass
-    try:
-        await page.evaluate("""
-          () => {
-            const blockers = Array.from(document.querySelectorAll('[role="dialog"], .modal, .overlay, [class*="cookie"]'));
-            for (const b of blockers) b.style.display='none';
-          }
-        """)
-    except Exception:
-        pass
-
-async def accept_cookies(page):
-    for s in ["button:has-text('Accept')","button:has-text('Accept All')","text=Accept all cookies"]:
-        try:
-            el = page.locator(s).first
-            if await el.is_visible(timeout=1000):
-                await el.click(); return
-        except Exception:
-            pass
-
-async def type_into_search(page, q: str):
-    for s in ["input[placeholder*='Search']", "input[type='search']", "form[role='search'] input", "#search"]:
-        try:
-            box = page.locator(s).first
-            await box.wait_for(state="visible", timeout=4000)
-            await box.click(); await box.fill("")
-            await box.type(q, delay=25)  # allow autosuggest
-            await box.press("Enter")
-            return
-        except Exception:
-            continue
-    raise RuntimeError("Search box not found")
-
-async def force_products_tab(page):
-    for s in ["a:has-text('Products')", "button:has-text('Products')", "li:has-text('Products') a"]:
-        try:
-            el = page.locator(s).first
-            if await el.is_visible(timeout=1000): await el.click(); return
-        except Exception:
-            pass
-
-async def scroll_to_bottom(page, max_iters=50):
-    stable = 0
-    last = await page.evaluate("document.body.scrollHeight")
-    for _ in range(max_iters):
-        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        await page.wait_for_timeout(1100)
-        cur = await page.evaluate("document.body.scrollHeight")
-        if cur <= last:
-            stable += 1
-            if stable >= 2: break
-        else:
-            stable = 0
-        last = cur
-    await page.wait_for_timeout(1200)
-
-def assign_spots(items: List[Dict[str, Any]]) -> None:
-    # Items are already top->bottom, left->right. Spots are 1..n in that order.
-    for i, it in enumerate(items, start=1):
-        it["spot"] = i
-
-async def find_spot(search_category: str, product_name: str, save_debug=False) -> Tuple[Optional[int], list]:
+async def find_spot(search_category: str, product_name: str, save_debug: bool = False) -> Tuple[Optional[int], List[str]]:
     async with async_playwright() as pw:
-        browser = await pw.chromium.browser = await pw.chromium.launch(headless=True, args=["--no-sandbox"])
-        context = await browser.new_context(viewport=VIEWPORT, user_agent=USER_AGENT, locale="en-ZA")
+        browser = await pw.chromium.launch(headless=True, args=["--no-sandbox"])
+        context = await browser.new_context(
+            viewport=VIEWPORT,
+            user_agent=USER_AGENT,
+        )
         page = await context.new_page()
 
-        await page.goto("https://www.takealot.com/", wait_until="domcontentloaded", timeout=45000)
-        await accept_cookies(page); await dismiss_popups(page)
-        await type_into_search(page, search_category)
-
-        try:
-            await page.wait_for_load_state("networkidle", timeout=30000)
-        except Exception:
-            pass
-
-        await force_products_tab(page)
-        await scroll_to_bottom(page, max_iters=60)
-        await dismiss_popups(page)
-
-        if save_debug:
-            try:
-                await page.screenshot(path="debug_results.png", full_page=True)
-                html = await page.content()
-                with open("debug_results.html", "w", encoding="utf-8") as f:
-                    f.write(html)
-            except Exception:
-                pass
+        url = f"https://www.takealot.com/all?_sb={search_category}"
+        await page.goto(url, timeout=60000)
+        await page.wait_for_timeout(3000)
 
         items = await page.evaluate(JS_SCRAPE_ACTION_ONLY)
         items = dedupe_by_box(items)
-        items.sort(key=lambda x: (x["y"], x["x"]))
-        assign_spots(items)
 
-        target = norm_title(product_name)
+        titles = [norm_title(it["title"]) for it in items]
+        norm_target = norm_title(product_name)
+
         spot = None
-        for it in items:
-            if norm_title(it["title"]) == target:
-                spot = it["spot"]; break
+        for idx, t in enumerate(titles, start=1):
+            if norm_target == t:
+                spot = idx
+                break
 
-        await context.close(); await browser.close()
-        return spot, items
+        await browser.close()
+        return spot, titles
 
-# ============================== UI ==============================
-st.set_page_config(page_title="Takealot Spot Finder — Add-to-Cart filtered", page_icon="🛒", layout="centered")
-st.title("🛒 Takealot Spot Finder (Add-to-Cart / Shop-all-options filtered)")
-st.caption("Counts only cards that include **Add to Cart** or **Shop all options**. Spots: left→right, top→bottom (4 per row).")
+# ---------- Streamlit UI ----------
+st.set_page_config(page_title="Takealot Spot Finder", page_icon="🔎", layout="centered")
+st.title("Takealot Spot Finder")
 
-with st.form("spot_form"):
-    search_category = st.text_input("Search category (typed into Takealot search):", value="Blood pressure monitor")
-    product_name = st.text_input("Product name (exact title to locate):", value="")
-    save_debug = st.checkbox("Debug: save full-page screenshot + HTML", value=False)
-    submitted = st.form_submit_button("Find spot")
+params = st.query_params
+prefill_cat = params.get("cat", "")
+prefill_name = params.get("name", "")
 
-if submitted:
-    if not product_name.strip():
-        st.error("Please enter the exact Product name.")
+search_category = st.text_input("Search Category", value=prefill_cat, placeholder="e.g. blood pressure monitor")
+product_name = st.text_input("Product Name (exact title)", value=prefill_name, placeholder="e.g. Beurer BM 28 Blood Pressure Monitor")
+
+if st.button("Find Spot"):
+    if not search_category or not product_name:
+        st.warning("Please enter both category and product name.")
     else:
-        with st.spinner("Searching Takealot and locating the product..."):
-            spot, seen = asyncio.run(find_spot(search_category.strip(), product_name.strip(), save_debug))
+        with st.spinner("Searching Takealot..."):
+            try:
+                spot, seen = asyncio.run(find_spot(search_category.strip(), product_name.strip()))
+                if spot is not None:
+                    st.success(f"✅ '{product_name}' found at Spot **{spot}**")
+                else:
+                    st.error(f"❌ '{product_name}' not found in first {len(seen)} products.")
+            except Exception as e:
+                st.error(f"Error: {e}")
 
-        st.subheader("Result")
-        if spot is not None:
-            st.success(f"Spot: {spot}")
-            st.caption("Spots are counted left→right in a 4-column grid (1–4, 5–8, 9–12, …).")
-        else:
-            st.warning("Product title not found among action-filtered tiles.")
-            if seen:
-                st.write("First 12 action-filtered titles on the page:")
-                for it in seen[:12]:
-                    st.write(f"{it['spot']:>3}: {it['title']}")
-        if save_debug:
-            st.caption("Saved: debug_results.png and debug_results.html next to app.py")
