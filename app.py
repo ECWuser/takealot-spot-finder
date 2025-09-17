@@ -1,6 +1,7 @@
 import asyncio, re
 from typing import List, Dict, Any, Optional, Tuple
 from urllib.parse import quote_plus
+from difflib import SequenceMatcher
 
 import streamlit as st
 from playwright.async_api import async_playwright
@@ -14,18 +15,45 @@ def norm_title(s: str) -> str:
     s = (s or "").strip().lower()
     s = s.replace("\u00a0", " ").replace("–", "-").replace("—", "-")
     s = re.sub(r"\s+", " ", s)
+    # remove common clutter chars
+    s = re.sub(r"[®™']", "", s)
     return s
+
+def similarity(a: str, b: str) -> float:
+    return SequenceMatcher(None, norm_title(a), norm_title(b)).ratio()
+
+def smart_match(target: str, candidates: list) -> Tuple[Optional[int], Optional[str]]:
+    """
+    Try exact, then containment, then similarity >= 0.92.
+    Returns (index, matched_title) where index is 1-based spot.
+    """
+    nt = norm_title(target)
+    best_idx, best_title, best_score = None, None, 0.0
+
+    for idx, t in enumerate(candidates, start=1):
+        ntc = norm_title(t)
+        if ntc == nt:
+            return idx, t
+        if nt in ntc or ntc in nt:
+            return idx, t
+        score = SequenceMatcher(None, nt, ntc).ratio()
+        if score > best_score:
+            best_score, best_idx, best_title = score, idx, t
+
+    if best_score >= 0.92:
+        return best_idx, best_title
+    return None, None
 
 def dedupe_by_box(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     seen, out = set(), []
     for it in items:
-        key = (round(it["x"], -1), round(it["y"], -1), it["title"])
+        key = (round(it["x"], -1), round(it["y"], -1), norm_title(it["title"]))
         if key in seen:
             continue
         seen.add(key); out.append(it)
     return out
 
-# Strict: require visible action control inside the card
+# Strict: require a visible action control inside the card
 JS_SCRAPE_ACTION_ONLY = r"""
 () => {
   const scope = document.querySelector('main') || document.body;
@@ -41,12 +69,13 @@ JS_SCRAPE_ACTION_ONLY = r"""
   }
 
   function hasAction(el){
-    // Prefer structural checks over raw innerText matches in headless
-    // 1) Any <button> inside
+    // structural checks first (headless-safe)
     if (el.querySelector('button')) return true;
-    // 2) Links that look like action controls
-    if (el.querySelector('a[href*="add"], a[href*="cart"], a:has(> span:matches(:scope, :contains("Add")))')) return true;
-    // 3) Text fallback (case-insensitive)
+    if (el.querySelector('[role="button"]')) return true;
+    if (el.querySelector('[aria-label*="Add"]')) return true;
+    // common class/attr patterns
+    if (el.querySelector('[data-test*="add"]')) return true;
+    // text fallback
     const t = (el.innerText || el.textContent || "").toLowerCase();
     return /add\s*to\s*cart|shop\s*all\s*options|add\s*to\s*basket|add\s*to\s*trolley/.test(t);
   }
@@ -61,11 +90,9 @@ JS_SCRAPE_ACTION_ONLY = r"""
       const x = Math.round(r.left + window.scrollX);
       const y = Math.round(r.top  + window.scrollY);
 
-      // PDP link inside this card (ignore brand/search links)
       const pdp = c.querySelector('a[href*="/p/"]:not([href*="/brand/"]):not([href*="/search"])');
       const href = pdp ? pdp.href : "";
 
-      // Prefer heading-like title; fallback to link text
       let title = "";
       const h = c.querySelector('h1,h2,h3,h4,[data-ref*="title"], .title, [class*="title"]');
       if (h) title = (h.innerText || h.textContent || "").trim();
@@ -76,7 +103,6 @@ JS_SCRAPE_ACTION_ONLY = r"""
     } catch(e){}
   }
 
-  // absolute page order: top->bottom, left->right
   out.sort((a,b)=> (a.y-b.y) || (a.x-b.x));
   return out;
 }
@@ -124,34 +150,13 @@ JS_SCRAPE_RELAXED = r"""
 }
 """
 
-async def dismiss_popups(page):
-    sels = [
-        "button:has-text('Accept')","button:has-text('Accept all')","button:has-text('Allow all')",
-        "button:has-text('Got it')","button:has-text('OK')","button:has-text('Close')",
-        "button[aria-label='Close']","button:has-text('No thanks')","button:has-text('Not now')",
-        "[data-test='close']","div[role='dialog'] button:has-text('×')",
-    ]
-    for s in sels:
-        try:
-            el = page.locator(s).first
-            if await el.is_visible(timeout=800): await el.click()
-        except Exception:
-            pass
-    try:
-        await page.evaluate("""
-          () => {
-            const blockers = Array.from(document.querySelectorAll('[role="dialog"], .modal, .overlay, [class*="cookie"]'));
-            for (const b of blockers) b.style.display='none';
-          }
-        """)
-    except Exception:
-        pass
-
 async def force_products_tab(page):
     for s in ["a:has-text('Products')", "button:has-text('Products')", "li:has-text('Products') a"]:
         try:
             el = page.locator(s).first
-            if await el.is_visible(timeout=1000): await el.click(); return
+            if await el.is_visible(timeout=1500):
+                await el.click()
+                return
         except Exception:
             pass
 
@@ -174,18 +179,17 @@ def assign_spots(items: List[Dict[str, Any]]) -> None:
     for i, it in enumerate(items, start=1):
         it["spot"] = i
 
-async def find_spot(search_category: str, product_name: str, save_debug=False) -> Tuple[Optional[int], list, bool]:
+async def find_spot(search_category: str, product_name: str) -> Tuple[Optional[int], list, bool, Optional[str]]:
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True, args=["--no-sandbox"])
         context = await browser.new_context(viewport=VIEWPORT, user_agent=USER_AGENT, locale="en-ZA")
         page = await context.new_page()
 
-        # Direct search URL avoids headless search box issues
+        # Direct search (headless-safe)
         q = quote_plus(search_category)
         url = f"https://www.takealot.com/all?_sb={q}"
         await page.goto(url, wait_until="domcontentloaded", timeout=60000)
 
-        await dismiss_popups(page)
         await force_products_tab(page)
 
         # Wait until at least one product tile appears
@@ -195,25 +199,15 @@ async def find_spot(search_category: str, product_name: str, save_debug=False) -
             pass
 
         await scroll_to_bottom(page, max_iters=60)
-        await dismiss_popups(page)
 
-        if save_debug:
-            try:
-                await page.screenshot(path="debug_results.png", full_page=True)
-                html = await page.content()
-                with open("debug_results.html", "w", encoding="utf-8") as f:
-                    f.write(html)
-            except Exception:
-                pass
-
-        # First try strict (action-only)
+        # Try strict first
         items = await page.evaluate(JS_SCRAPE_ACTION_ONLY)
         items = dedupe_by_box(items)
         items.sort(key=lambda x: (x["y"], x["x"]))
         assign_spots(items)
         used_fallback = False
 
-        # Fallback: if action tiles are 0, use relaxed tiles
+        # Fallback if nothing found
         if len(items) == 0:
             used_fallback = True
             items = await page.evaluate(JS_SCRAPE_RELAXED)
@@ -221,19 +215,15 @@ async def find_spot(search_category: str, product_name: str, save_debug=False) -
             items.sort(key=lambda x: (x["y"], x["x"]))
             assign_spots(items)
 
-        target = norm_title(product_name)
-        spot = None
-        for it in items:
-            if norm_title(it["title"]) == target:
-                spot = it["spot"]; break
+        titles = [it["title"] for it in items]
+        spot, matched_title = smart_match(product_name, titles)
 
         await context.close(); await browser.close()
-        return spot, items, used_fallback
+        return spot, items, used_fallback, matched_title
 
 # ============================== UI ==============================
-st.set_page_config(page_title="Takealot Spot Finder — Add-to-Cart filtered", page_icon="🛒", layout="centered")
-st.title("🛒 Takealot Spot Finder (Add-to-Cart / Shop-all-options filtered)")
-st.caption("Counts only cards that include a purchase action. Falls back to all product tiles if none are detected in headless mode.")
+st.set_page_config(page_title="Takealot Spot Finder", page_icon="🔎", layout="centered")
+st.title("Takealot Spot Finder")
 
 # Prefill from URL params for Excel links
 params = st.query_params
@@ -242,8 +232,7 @@ prefill_name = params.get("name", "")
 
 with st.form("spot_form"):
     search_category = st.text_input("Search category:", value=(prefill_cat or "Blood pressure monitor"))
-    product_name = st.text_input("Product name (exact title to locate):", value=(prefill_name or ""))
-    save_debug = st.checkbox("Debug: save full-page screenshot + HTML", value=False)
+    product_name = st.text_input("Product name (exact title):", value=(prefill_name or ""))
     submitted = st.form_submit_button("Find spot")
 
 if submitted:
@@ -251,13 +240,16 @@ if submitted:
         st.error("Please enter the exact Product name.")
     else:
         with st.spinner("Searching Takealot and locating the product..."):
-            spot, seen, used_fallback = asyncio.run(find_spot(search_category.strip(), product_name.strip(), save_debug))
+            spot, seen, used_fallback, matched_title = asyncio.run(find_spot(search_category.strip(), product_name.strip()))
 
         st.subheader("Result")
         if spot is not None:
             if used_fallback:
-                st.info(f"Fallback mode used (no action buttons detected).")
-            st.success(f"Spot: {spot}")
+                st.info("Fallback used (no action buttons detected in headless).")
+            if matched_title and norm_title(matched_title) != norm_title(product_name):
+                st.success(f"Spot: {spot}  \nMatched: **{matched_title}**")
+            else:
+                st.success(f"Spot: {spot}")
             st.caption("Spots are counted left→right in a 4-column grid (1–4, 5–8, 9–12, …).")
         else:
             st.warning("Product title not found among parsed tiles.")
@@ -267,6 +259,4 @@ if submitted:
                 st.write("First 12 parsed titles on the page:")
                 for it in seen[:12]:
                     st.write(f"{it['spot']:>3}: {it['title']}")
-        if save_debug:
-            st.caption("Saved: debug_results.png and debug_results.html next to app.py")
 
