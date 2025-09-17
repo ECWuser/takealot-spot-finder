@@ -153,7 +153,7 @@ def assign_spots(items: List[Dict[str, Any]]) -> None:
 
 async def find_spot(search_category: str, product_name: str, save_debug=False) -> Tuple[Optional[int], list]:
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=False)
+        browser = await pw.chromium.browser = await pw.chromium.launch(headless=True, args=["--no-sandbox"])
         context = await browser.new_context(viewport=VIEWPORT, user_agent=USER_AGENT, locale="en-ZA")
         page = await context.new_page()
 
