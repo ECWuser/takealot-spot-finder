@@ -1,10 +1,10 @@
-import asyncio, re
+import asyncio, json, re
 from typing import List, Dict, Any, Optional, Tuple
 from urllib.parse import quote_plus
 from difflib import SequenceMatcher
 
 import streamlit as st
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, Response
 
 # ---------- constants ----------
 VIEWPORT = {"width": 1440, "height": 900}
@@ -19,67 +19,28 @@ def norm_title(s: str) -> str:
     s = re.sub(r"[®™']", "", s)
     return s
 
-def similarity(a: str, b: str) -> float:
-    return SequenceMatcher(None, norm_title(a), norm_title(b)).ratio()
-
-def smart_match(target: str, candidates: list) -> Tuple[Optional[int], Optional[str]]:
+def best_match(target: str, candidates: List[str]) -> Tuple[Optional[int], Optional[str], float]:
+    """Return (1-based index, matched_title, similarity score). Always returns best candidate if any."""
+    if not candidates:
+        return None, None, 0.0
     nt = norm_title(target)
-    best_idx, best_title, best_score = None, None, 0.0
-    for idx, t in enumerate(candidates, start=1):
-        ntc = norm_title(t)
-        if ntc == nt: return idx, t                      # exact
-        if nt in ntc or ntc in nt: return idx, t         # contains
-        score = SequenceMatcher(None, nt, ntc).ratio()   # fuzzy
-        if score > best_score:
-            best_score, best_idx, best_title = score, idx, t
-    if best_score >= 0.92:
-        return best_idx, best_title
-    return None, None
+    best_i, best_t, best_s = None, None, 0.0
+    for i, c in enumerate(candidates, start=1):
+        nc = norm_title(c)
+        if nc == nt:
+            return i, c, 1.0
+        if nt in nc or nc in nt:
+            return i, c, 0.99
+        s = SequenceMatcher(None, nt, nc).ratio()
+        if s > best_s:
+            best_s, best_i, best_t = s, i, c
+    return best_i, best_t, best_s
 
-def dedupe_by_box(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    seen, out = set(), []
-    for it in items:
-        key = (round(it["x"], -1), round(it["y"], -1), norm_title(it["title"]))
-        if key in seen: continue
-        seen.add(key); out.append(it)
-    return out
+def assign_spots(items: List[Dict[str, Any]]) -> None:
+    for i, it in enumerate(items, start=1):
+        it["spot"] = i
 
-# Strict: require a visible action control inside the card (headless-safe)
-JS_SCRAPE_ACTION_ONLY = r"""
-() => {
-  const scope = document.querySelector('main') || document.body;
-  if (!scope) return [];
-  const cards = Array.from(scope.querySelectorAll(
-    'article, li, div[data-ref*="product"], div[data-ref*="tile"], div[class*="product"], div[class*="card"]'
-  ));
-  function bigEnough(el){
-    const r = el.getBoundingClientRect(); return r.width > 120 && r.height > 120;
-  }
-  function hasAction(el){
-    if (el.querySelector('button, [role="button"], [data-test*="add"], [data-qa*="add"]')) return true;
-    const t = (el.innerText || el.textContent || '').toLowerCase();
-    return /add\s*to\s*cart|shop\s*all\s*options|add\s*to\s*basket|add\s*to\s*trolley/.test(t);
-  }
-  const out = [];
-  for (const c of cards) {
-    try {
-      if (!bigEnough(c) || !hasAction(c)) continue;
-      const pdp = c.querySelector('a[href*="/p/"]:not([href*="/brand/"]):not([href*="/search"])');
-      if (!pdp) continue;
-      const card = pdp.closest('article,li,div[data-ref*="product"],div[data-ref*="tile"],div[class*="product"],div[class*="card"]') || c;
-      const r = card.getBoundingClientRect();
-      const x = Math.round(r.left + window.scrollX), y = Math.round(r.top + window.scrollY);
-      let title = (pdp.getAttribute('title') || pdp.innerText || pdp.textContent || '').trim();
-      if (!title) continue;
-      out.push({ href: pdp.href, title, x, y, w: Math.round(r.width), h: Math.round(r.height) });
-    } catch(e){}
-  }
-  out.sort((a,b)=> (a.y-b.y) || (a.x-b.x));
-  return out;
-}
-"""
-
-# Relaxed fallback: accept product tiles even if we can’t prove the action control
+# --------- DOM fallbacks (only used if network JSON not found) ----------
 JS_SCRAPE_RELAXED = r"""
 () => {
   const scope = document.querySelector('main') || document.body;
@@ -97,7 +58,7 @@ JS_SCRAPE_RELAXED = r"""
       out.push({ href: pdp.href, title, x, y, w: Math.round(r.width), h: Math.round(r.height) });
     } catch(e){}
   }
-  out.sort((a,b)=> (a.y-b.y) || (a.x-b-x));
+  out.sort((a,b)=> (a.y-b.y) || (a.x-b.x));
   return out;
 }
 """
@@ -106,7 +67,8 @@ async def wait_for_min_products(page, minimum=8, timeout_ms=25000):
     elapsed = 0
     while elapsed < timeout_ms:
         count = await page.locator("a[href*='/p/']").count()
-        if count >= minimum: return True
+        if count >= minimum:
+            return True
         await page.wait_for_timeout(500)
         elapsed += 500
     return False
@@ -122,10 +84,96 @@ async def scroll_to_bottom(page, max_iters=24):
         last = cur
     await page.wait_for_timeout(800)
 
-def assign_spots(items: List[Dict[str, Any]]) -> None:
-    for i, it in enumerate(items, start=1):
-        it["spot"] = i
+# ---------- Network JSON helpers ----------
+def _extract_products_from_json(obj: Any) -> List[Dict[str, Any]]:
+    """
+    Heuristic: search nested dict/list for arrays of product-like objects:
+    - must have a title/name AND a PDP URL slug or URL containing '/p/'
+    - optional availability flags used to filter actionable items
+    """
+    found: List[Dict[str, Any]] = []
 
+    def looks_like_product(x: Any) -> Optional[Dict[str, Any]]:
+        if not isinstance(x, dict):
+            return None
+        # title/name fields
+        title = x.get("title") or x.get("name") or x.get("productTitle") or x.get("product_name")
+        # PDP URL fields
+        url = (x.get("url") or x.get("pdpUrl") or x.get("productUrl") or x.get("link") or "")
+        slug = x.get("slug") or x.get("slugUrl") or x.get("seoUrl") or ""
+        # availability-ish flags
+        buyable = x.get("buyable") or x.get("isBuyable") or x.get("is_buyable") or x.get("available") or x.get("inStock")
+
+        # Compose a PDP path if we only have a slug-ish piece
+        if not url and slug:
+            url = str(slug)
+        if not (title and isinstance(title, str)):
+            return None
+        if not isinstance(url, str):
+            return None
+        if "/p/" not in url:
+            # try to coerce to full PDP path
+            if url and not url.startswith("http"):
+                url = f"/p/{url.strip('/')}"
+            # still not PDP-like? give up
+            if "/p/" not in url:
+                return None
+        return {"title": title, "url": url, "buyable": bool(buyable)}
+
+    def walk(node: Any):
+        if isinstance(node, list):
+            # if this list looks like products, pull them all
+            prod_candidates = []
+            for el in node:
+                prod = looks_like_product(el)
+                if prod:
+                    prod_candidates.append(prod)
+            if prod_candidates:
+                found.extend(prod_candidates)
+            else:
+                for el in node:
+                    walk(el)
+        elif isinstance(node, dict):
+            for _, v in node.items():
+                walk(v)
+
+    walk(obj)
+    return found
+
+async def collect_products_via_network(page) -> List[Dict[str, Any]]:
+    """
+    Attach a response listener while the page loads; parse any JSON that contains product arrays.
+    Return the first stable, non-empty list we find.
+    """
+    collected: List[Dict[str, Any]] = []
+    done = asyncio.Event()
+
+    async def on_response(resp: Response):
+        try:
+            ct = resp.headers.get("content-type", "")
+            if "application/json" not in ct:
+                return
+            # Ignore too-small or too-large responses to save time
+            if resp.request.resource_type in {"image", "font"}:
+                return
+            if resp.status != 200:
+                return
+            data = await resp.json()
+            prods = _extract_products_from_json(data)
+            if prods:
+                # keep only title/url/buyable
+                for p in prods:
+                    p["title"] = (p.get("title") or "").strip()
+                    p["url"] = p.get("url") or ""
+                collected[:] = prods  # replace with latest
+                # we don't set done immediately; we let page settle a bit
+        except Exception:
+            return
+
+    page.on("response", on_response)
+    return collected, done  # caller can read from 'collected' after navigation
+
+# ---------- Core find routine ----------
 async def find_spot(search_category: str, product_name: str):
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True, args=["--no-sandbox"])
@@ -138,45 +186,38 @@ async def find_spot(search_category: str, product_name: str):
         )
         page = await context.new_page()
 
+        # Start network collection
+        net_products, _ = await collect_products_via_network(page)
+
+        # Navigate directly to search
         q = quote_plus(search_category)
         url = f"https://www.takealot.com/all?_sb={q}"
         await page.goto(url, wait_until="domcontentloaded", timeout=60000)
 
-        # ensure enough tiles exist
-        await wait_for_min_products(page, minimum=8, timeout_ms=25000)
-        await scroll_to_bottom(page)
+        # Give network a short window to populate
+        await wait_for_min_products(page, minimum=8, timeout_ms=20000)
+        await asyncio.sleep(0.5)  # tiny grace
+        await scroll_to_bottom(page, max_iters=12)
 
-        # STRICT
-        strict = await page.evaluate(JS_SCRAPE_ACTION_ONLY)
-        strict = dedupe_by_box(strict)
-        strict.sort(key=lambda x: (x["y"], x["x"]))
-        assign_spots(strict)
+        # Prefer network JSON if available
+        items: List[Dict[str, Any]] = []
+        if net_products:
+            # Keep ordering: left->right, top->bottom is a UI concept, but network list is already in listing order.
+            # We just map them to a flat list.
+            for p in net_products:
+                items.append({"title": p["title"], "href": p["url"]})
+        else:
+            # Fallback to DOM relaxed
+            dom = await page.evaluate(JS_SCRAPE_RELAXED)
+            for d in dom:
+                items.append({"title": d["title"], "href": d.get("href", "")})
 
-        # RELAXED
-        relaxed = await page.evaluate(JS_SCRAPE_RELAXED)
-        relaxed = dedupe_by_box(relaxed)
-        relaxed.sort(key=lambda x: (x["y"], x["x"]))
-        assign_spots(relaxed)
-
-        # Try match (first strict, then relaxed)
-        spot = None
-        matched_from = "strict"
-        titles_strict = [it["title"] for it in strict]
-        titles_relaxed = [it["title"] for it in relaxed]
-
-        if titles_strict:
-            spot_idx, matched_title = smart_match(product_name, titles_strict)
-            if spot_idx is not None:
-                spot = spot_idx
-            else:
-                matched_from = "relaxed"
-        if spot is None:
-            spot_idx, matched_title = smart_match(product_name, titles_relaxed)
-            if spot_idx is not None:
-                spot = spot_idx
+        assign_spots(items)
+        titles = [it["title"] for it in items]
+        idx, matched_title, score = best_match(product_name, titles)
 
         await context.close(); await browser.close()
-        return spot, strict, relaxed
+        return idx, matched_title, score, titles[:30]  # return a sample for debugging in UI
 
 # ============================== UI ==============================
 st.set_page_config(page_title="Takealot Spot Finder", page_icon="🔎", layout="centered")
@@ -196,19 +237,18 @@ if submitted:
         st.error("Please enter the exact Product name.")
     else:
         with st.spinner("Searching..."):
-            spot, strict, relaxed = asyncio.run(find_spot(search_category.strip(), product_name.strip()))
+            spot, matched, score, sample = asyncio.run(find_spot(search_category.strip(), product_name.strip()))
 
         st.subheader("Result")
         if spot is not None:
-            st.success(f"Spot: {spot}  (counted left→right, 4 per row)")
+            extra = f"  \n(approximate match {score:.2f})" if score < 0.98 else ""
+            st.success(f"Spot: {spot}{extra}")
+            if matched and norm_title(matched) != norm_title(product_name):
+                st.caption(f"Matched: **{matched}**")
         else:
-            st.warning("Product title not found among parsed tiles.")
-
-        # Always show what we saw (to debug headless rendering)
-        with st.expander(f"Strict (action buttons present) — {len(strict)} items"):
-            for it in strict[:30]:
-                st.write(f"{it['spot']:>3}: {it['title']}")
-        with st.expander(f"Relaxed (all product tiles) — {len(relaxed)} items"):
-            for it in relaxed[:30]:
-                st.write(f"{it['spot']:>3}: {it['title']}")
+            st.warning("Product title not found in the first parsed results.")
+        if sample:
+            with st.expander(f"First {len(sample)} titles I saw (for troubleshooting):"):
+                for i, t in enumerate(sample, start=1):
+                    st.write(f"{i:>3}: {t}")
 
